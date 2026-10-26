@@ -1404,6 +1404,16 @@ def _pre_exec_block(
         if blocked:
             raise _Rejected(blocked)
 
+    # 5) Terminal IO policy guard: refuse the self-inflicted whole-tree IO
+    #    patterns (whole-home du, whole-tree grep/rg, whole-filesystem find,
+    #    analytic scans of the live state.db).
+    from tools.terminal_io_guard import deny_terminal_io
+
+    denied = deny_terminal_io(command)
+    if denied:
+        logger.warning("io_guard: %s (command: %s)", denied, _safe_command_preview(command))
+        raise _Rejected(_error_json(denied, status="blocked"))
+
 
 _PTY_DISABLED_REASON = (
     "PTY disabled for this command because it expects piped stdin/EOF "

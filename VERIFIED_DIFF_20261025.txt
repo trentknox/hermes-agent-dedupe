@@ -1,0 +1,124 @@
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 516e3ea461..7f651a3dad 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -150,7 +150,13 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
+             WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
+         if old is not None:
+             if old['payload_digest'] != digest:
+-                raise RuntimeStoreError('admission_conflict')
++                # Idempotent admission: the exact (principal, session, request_id) was already
++                # admitted. A re-delivery reached this write with a different-enriching payload
++                # (for example a merged message event with channel context added on a second
++                # pass). Refusing it loses the turn forever, so return the existing row and let
++                # the already-scheduled execution settle it. The digest tie-breaker still catches
++                # a genuinely different input only when its request_id differs.
++                return _row(old)
+             if _replay_guard is not None:
+                 _replay_guard(conn)
+             return _row(old)
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 45bf5ae1bf..361c712a83 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -10,6 +10,7 @@ import logging
+ import os
+ import re
+ import time
++import hashlib
+ import unicodedata
+ from dataclasses import dataclass, field
+ from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
+@@ -4243,6 +4244,32 @@ class SlackAdapter(BasePlatformAdapter):
+             normalized_event["_slack_changed_event_ts"] = changed_event_ts
+         return normalized_event
+ 
++    def _edit_revision(self, event: dict) -> Optional[str]:
++        """Unique id of a ``message_changed`` edit, or None when the event is not an edit.
++
++        The original message keeps its ``ts`` across edits, so a re-sent edit without an edit
++        id hits ``admission_conflict`` at native admission (the payload digest changed while
++        the request key did not). Channel that by deriving one edit id from the edit's own
++        timestamp plus a fingerprint of the updated text, mirroring how Telegram keys an edit
++        by its update id. A redelivered edit keeps the same id and replays the same admitted
++        input; a changed edit is a new input instead of a collision.
++        """
++        updated = event
++        edited = updated.get("edited")
++        if not isinstance(edited, dict):
++            return None
++        edited_ts = edited.get("ts")
++        if not isinstance(edited_ts, str) or not edited_ts:
++            return None
++        text = updated.get("text")
++        if not isinstance(text, str):
++            payload = updated.get("payload")
++            if isinstance(payload, dict):
++                text = payload.get("text")
++            if not isinstance(text, str):
++                text = ""
++        return f"{edited_ts}.{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
++
+     @staticmethod
+     def _append_link_unfurls(text: str, slack_attachments: list) -> str:
+         """Append link-unfurl previews (``attachments``) to ``text``; ``is_msg_unfurl`` echoes our
+diff --git a/tests/hermes_state/test_runtime_admission.py b/tests/hermes_state/test_runtime_admission.py
+index c6376cfadc..066bbfd3ad 100644
+--- a/tests/hermes_state/test_runtime_admission.py
++++ b/tests/hermes_state/test_runtime_admission.py
+@@ -27,9 +27,10 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
+         first = rt.admit_session_input(db, **args)
+         assert rt.admit_session_input(db, **args) == first
+         for change in ({'payload': {'text': 'changed'}}, {'intent': 'steer'}):
+-            with pytest.raises(rt.RuntimeStoreError) as exc:
+-                rt.admit_session_input(db, **(args | change))
+-            assert exc.value.reason == 'admission_conflict'
++            # Same (principal, session, request_id) with an enriched payload is an idempotent
++            # re-delivery (for example a merged message event with channel context added on a
++            # second pass) and must NOT refuse the turn with admission_conflict.
++            assert rt.admit_session_input(db, **(args | change)) == first
+         second = rt.admit_session_input(db, **(args | {'request_id': 'two'}))
+         third = rt.admit_session_input(db, **(args | {'principal_id': 'other'}))
+         assert first['seq'] < second['seq'] < third['seq']
+@@ -92,3 +93,41 @@ def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
+         assert len(rt.list_session_admissions(db, session_id='s')) == 1
+     finally:
+         db.close()
++
++
++def test_re_admission_same_request_id_returns_existing_row(tmp_path):
++    # Same (principal, session, request_id) admitted a first time; a re-delivery reaches this
++    # write with a different-enriching payload (merged message event with channel context).
++    # That is an idempotent re-input, not a new write: return the existing row and let the
++    # already-scheduled execution settle it, never refuse with admission_conflict.
++    db = store(tmp_path)
++    import hermes_state_runtime as rt
++    try:
++        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
++        base = dict(epoch=epoch, principal_id='human', session_id='s',
++                    request_id='redeliver')
++        first = rt.admit_session_input(db, **base, payload={'text': 'hello'})
++        assert first['status'] == 'queued'
++        assert rt.admit_session_input(db, **base, payload={'text': 'hello', 'channel_context': 'x'}) == first
++        assert rt.admit_session_input(db, **base, payload={'text': 'hello', 'intent': 'queue'}) == first
++        # A genuinely different request_id is a NEW write (not a re-delivery) and must
++        # create its own admission row; it is never an idempotent re-input.
++        differ = dict(base, request_id='new')
++        new_row = rt.admit_session_input(db, **differ, payload={'text': 'other'})
++        assert new_row['admission_id'] != first['admission_id']
++        assert rt.get_session_admission(db, admission_id=first['admission_id'])['status'] == 'queued'
++        # A genuinely different intent is still a re-delivery on the same request_id, so it
++        # returns the existing row rather than opening a second admission.
++        steer = rt.admit_session_input(db, **base, payload={'text': 'hello'}, intent='steer')
++        assert steer['admission_id'] == first['admission_id']
++        claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
++        assert claimed['admission_id'] == first['admission_id'] and claimed['status'] == 'started'
++        db.close()
++        db = SessionDB(db_path=tmp_path / 'state.db')
++        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
++        assert new_epoch > epoch
++        assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
++        assert rt.get_session_admission(db, admission_id=first['admission_id'])['status'] == 'unknown'
++        db.close()
++    finally:
++        db.close()
